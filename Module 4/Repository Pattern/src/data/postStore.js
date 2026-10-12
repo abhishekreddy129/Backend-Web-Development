@@ -3,9 +3,6 @@ const posts = [
   { id: 2, title: 'Second post', body: 'Services should speak in domain language.', authorId: 8 },
 ];
 
-let nextId = 3;
-
 module.exports = {
   posts,
-  nextId: () => nextId++,
 };
