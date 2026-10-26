@@ -9,8 +9,12 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'lu51-test-secret-do-not-use-
 
 const http = require('http');
 const jwt = require('jsonwebtoken');
+const requireAuth = require('../src/middleware/requireAuth');
 
 const SECRET = process.env.JWT_SECRET;
+const AUTH_ERROR = {
+  error: { code: 'AUTH_REQUIRED', message: 'Authentication required' },
+};
 
 // Silence the app's listen log during tests
 const originalLog = console.log;
@@ -48,6 +52,30 @@ function request(server, options, body) {
   });
 }
 
+function invokeMiddleware(authHeader) {
+  const req = { headers: {} };
+  if (authHeader !== undefined) {
+    req.headers.authorization = authHeader;
+  }
+
+  let status;
+  let body;
+  let nextCalls = 0;
+  const res = {
+    status(code) {
+      status = code;
+      return this;
+    },
+    json(value) {
+      body = value;
+      return this;
+    },
+  };
+
+  requireAuth(req, res, () => { nextCalls++; });
+  return { req, status, body, nextCalls };
+}
+
 let passed = 0;
 let failed = 0;
 
@@ -65,14 +93,77 @@ async function runTests() {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   console.log('\nLU 51 — Authentication Middleware Tests\n');
 
+  console.log('Test 0: Strict Bearer parsing and JWT verification');
+  {
+    const originalVerify = jwt.verify;
+    let verifyCalls = 0;
+    jwt.verify = (...args) => {
+      verifyCalls++;
+      return originalVerify(...args);
+    };
+
+    try {
+      for (const authHeader of [
+        undefined,
+        'Basic dXNlcjpwYXNz',
+        'Token abc',
+        'Bearer ',
+        'Bearer  token',
+        'Bearer token ',
+        'Bearer\ttoken',
+        'Bearer token extra',
+      ]) {
+        const result = invokeMiddleware(authHeader);
+        assert(
+          result.status === 401 &&
+            JSON.stringify(result.body) === JSON.stringify(AUTH_ERROR) &&
+            result.nextCalls === 0 &&
+            result.req.user === undefined,
+          `Rejects unusable Authorization header (${String(authHeader)})`
+        );
+      }
+      assert(verifyCalls === 0, 'Does not verify tokens from unusable Authorization headers');
+
+      const validToken = jwt.sign({ sub: 'user-7' }, SECRET, { algorithm: 'HS256', expiresIn: '1h' });
+      const invalidTokens = [
+        'not.a.jwt',
+        validToken.slice(0, -1) + (validToken.endsWith('a') ? 'b' : 'a'),
+        jwt.sign({ sub: 'user-7' }, SECRET, { algorithm: 'HS384', expiresIn: '1h' }),
+        jwt.sign({ sub: 'user-7' }, SECRET, { algorithm: 'HS256', expiresIn: '0s' }),
+      ];
+
+      for (const token of invalidTokens) {
+        const result = invokeMiddleware(`Bearer ${token}`);
+        assert(
+          result.status === 401 &&
+            JSON.stringify(result.body) === JSON.stringify(AUTH_ERROR) &&
+            result.nextCalls === 0 &&
+            result.req.user === undefined,
+          'Rejects invalid, unsupported, tampered, or expired JWT without attaching req.user'
+        );
+      }
+
+      const verified = invokeMiddleware(`bEaReR ${validToken}`);
+      assert(
+        verified.status === undefined &&
+          verified.body === undefined &&
+          verified.nextCalls === 1 &&
+          verified.req.user.sub === 'user-7',
+        'Accepts case-insensitive Bearer and calls next with verified req.user'
+      );
+    } finally {
+      jwt.verify = originalVerify;
+    }
+  }
+
   // ── Test 1: Missing token returns 401 ─────────────────────────────────────
   console.log('Test 1: Missing Authorization header');
   {
     const res = await request(server, { path: '/profile' });
     assert(res.status === 401, `Status is 401 (got ${res.status})`);
     assert(
-      res.body?.error?.code === 'AUTH_REQUIRED',
-      `Body has error.code AUTH_REQUIRED (got ${res.body?.error?.code})`
+      JSON.stringify(res.body) === JSON.stringify(AUTH_ERROR),
+      'Body uses the exact generic AUTH_REQUIRED error'
     );
   }
 
